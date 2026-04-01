@@ -2,7 +2,7 @@ import os
 import targets
 import testlib
 
-class spike64_hart(targets.Hart):
+class spike64_sdsec_deny_hart(targets.Hart):
     xlen = 64
     ram = 0x1212340000
     ram_size = 0x10000000
@@ -12,18 +12,19 @@ class spike64_hart(targets.Hart):
     link_script_path = "spike64.lds"
     misa = 0x8000000000141125
 
-class spike64(targets.Target):
-    harts = [spike64_hart()]
-    openocd_config_path = "spike-1.cfg"
+class spike64_sdsec_deny(targets.Target):
+    harts = [spike64_sdsec_deny_hart()]
+    openocd_config_path = "spike-sdsec-deny.cfg"
     timeout_sec = 180
-    implements_custom_test = True
-    freertos_binary = "bin/RTOSDemo64.axf"
-    support_unavailable_control = True
+    support_sdsec = True
+    sdsec_mmode_debug = False
+    sdsec_smode_debug = False
+    sdsec_deny = True
+    support_memory_sampling = False
 
     def create(self):
-        os.environ['RISCV_MDBGEN_INIT'] = '1'
-        os.environ['RISCV_MDTCFG_INIT'] = '0x7'
-        # 32-bit FPRs only
+        os.environ['RISCV_MDBGEN_INIT'] = '0'
+        os.environ['RISCV_MDTCFG_INIT'] = '0x0'
         return testlib.Spike(self, isa="RV64IMAFC_sdsec",
                 abstract_rti=30, support_abstract_csr=True,
                 support_abstract_fpr=True)

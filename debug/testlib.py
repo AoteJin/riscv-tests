@@ -70,7 +70,8 @@ class Spike:
             isa=None, progbufsize=None, dmi_rti=None, abstract_rti=None,
             support_hasel=True, support_abstract_csr=True,
             support_abstract_fpr=False, support_haltgroups=True,
-            support_abstractauto=True, vlen=128, elen=64, harts=None):
+            support_abstractauto=True, vlen=128, elen=64, harts=None,
+            init_compile_args=None):
         """Launch spike. Return tuple of its process and the port it's running
         on."""
         self.process = None
@@ -89,9 +90,14 @@ class Spike:
         self.harts = harts or target.harts or [target]
 
         cmd = self.command(target, halted, timeout, with_jtag_gdb)
-        self.infinite_loop = target.compile(self.harts[0],
-                "programs/checksum.c", "programs/tiny-malloc.c",
-                "programs/infinite_loop.S", "-DDEFINE_MALLOC", "-DDEFINE_FREE")
+        if init_compile_args:
+            self.infinite_loop = target.compile(self.harts[0],
+                    *init_compile_args)
+        else:
+            self.infinite_loop = target.compile(self.harts[0],
+                    "programs/checksum.c", "programs/tiny-malloc.c",
+                    "programs/infinite_loop.S", "-DDEFINE_MALLOC",
+                    "-DDEFINE_FREE")
         cmd.append(self.infinite_loop)
         # pylint: disable-next=consider-using-with
         self.logfile = tempfile.NamedTemporaryFile(prefix="spike-",

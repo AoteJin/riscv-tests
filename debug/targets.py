@@ -163,6 +163,15 @@ class Target:
     # Supports exception trigger
     support_etrigger = True
 
+    # Target implements Sdsec/dmextsec extension
+    support_sdsec = False
+
+    # M-mode debug access expected (mdbgen=1)
+    sdsec_mmode_debug = True
+
+    # S-mode debug access expected (SEDBGALW=1 or mdbgen=1)
+    sdsec_smode_debug = True
+
     # Internal variables:
     directory = None
     temporary_files = []

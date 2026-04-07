@@ -900,7 +900,7 @@ class SdsecNdmResetReadOnlyZero(SdsecTest):
 
 
 
-# ---------- Phase 6: VS-mode suite (T51) ----------
+# ---------- Phase 6: VS-mode suite (T51, T53, T58, T59) ----------
 
 class SdsecVsmodeTest(SdsecTest):
     compile_args = ("programs/sdsec_vsmode.S", )
@@ -988,6 +988,120 @@ class SdsecVsmodeNoStopHigherModes(SdsecVsmodeTest):
         allsecured = (dmstatus >> 21) & 1
         assertEqual(allsecured, 1,
                     "ALLSECURED must be 1 with mdbgen=0")
+        # Clear haltreq
+        self.gdb.command(f"monitor riscv dm_write 0x{DMCONTROL:x} 0x00000001")
+
+class SdsecVsmodeMemoryAccess(SdsecVsmodeTest):
+    """T58: VS-mode debug memory read/write at hart.ram (sdsec.adoc memory constraints).
+
+    After halting in VS-mode (same pattern as T51), write a value to hart.ram
+    via GDB, read it back, and verify the match.  No page tables are active
+    (vsatp=0, hgatp=0), so the access uses physical addresses.
+    No security faults expected."""
+
+    def early_applicable(self):
+        return super().early_applicable() \
+            and not getattr(self.target, 'sdsec_vsmode_hsonly', False)
+
+    def test(self):
+        DMCONTROL = 0x10
+        DMSTATUS = 0x11
+        # Wait for M -> HS -> VS transition
+        time.sleep(0.5)
+        # Halt the hart in VS-mode
+        self.gdb.command(f"monitor riscv dm_write 0x{DMCONTROL:x} 0x80000001")
+        time.sleep(0.5)
+        dmstatus = self.read_dm_reg(DMSTATUS)
+        allhalted = (dmstatus >> 9) & 1
+        assertEqual(allhalted, 1,
+                    "hart must halt in VS-mode when VSEDBGALW=1")
+
+        # Write a test value to hart.ram
+        addr = self.hart.ram
+        test_val = 0xbeefcafe
+        self.gdb.p(f"*((unsigned int*)0x{addr:x}) = 0x{test_val:x}")
+        readback = self.gdb.p(f"*((unsigned int*)0x{addr:x})")
+        assertEqual(readback, test_val,
+                    "VS-mode debug memory write/read at hart.ram must succeed")
+
+        # No security faults
+        any_f, _ = self.parse_security_faults()
+        assertEqual(any_f, 0,
+                    "VS-mode memory access must not raise security faults")
+
+        # Clear haltreq
+        self.gdb.command(f"monitor riscv dm_write 0x{DMCONTROL:x} 0x00000001")
+
+class SdsecVsmodeVirtTranslation(SdsecTest):
+    """T59: Two-stage address translation under VS-mode debug access.
+
+    Requires the vsmode-vm target (Sv48 vsatp + Sv48x4 hgatp identity map).
+    Verifies:
+      1. Hart halts in VS-mode with two-stage translation active
+      2. Write/read via mapped VA succeeds through both translation stages
+      3. Access to an unmapped VA fails with 'Cannot access memory'
+      4. No security faults from any of these operations
+    """
+    compile_args = ("programs/sdsec_vsmode_vm.c", )
+
+    def early_applicable(self):
+        return self.target.support_sdsec and \
+            getattr(self.target, 'sdsec_vm_test', False) and \
+            getattr(self.target, 'sdsec_vsmode_debug', False)
+
+    def setup(self):
+        pass
+
+    def test(self):
+        DMCONTROL = 0x10
+        DMSTATUS = 0x11
+        # Wait for M -> HS -> VS transition with two-stage page table setup.
+        # The C program has large BSS arrays (16KB hgatp + 4KB vsatp) that
+        # init.c must zero, which takes many seconds through the debug
+        # interface. Issue haltreq and poll until the hart reaches VS-mode.
+        self.gdb.command(f"monitor riscv dm_write 0x{DMCONTROL:x} 0x80000001")
+        halted = False
+        for _ in range(60):
+            time.sleep(0.5)
+            dmstatus = self.read_dm_reg(DMSTATUS)
+            if (dmstatus >> 9) & 1:
+                halted = True
+                break
+        assertEqual(halted, True,
+                    "hart must halt in VS-mode when VSEDBGALW=1 (waited 30s)")
+
+        # Confirm VM is active via program flag
+        vm_active = self.gdb.p("vm_active")
+        assertEqual(vm_active, 1,
+                    "vm_active flag must be set (two-stage translation enabled)")
+
+        # Write/read via mapped VA (identity-mapped: VA == GPA == HPA)
+        mapped_va = self.hart.ram  # 0x1212340000
+        test_val = 0xfade0059
+        self.gdb.p(f"*((unsigned int*)0x{mapped_va:x}) = 0x{test_val:x}")
+        readback = self.gdb.p(f"*((unsigned int*)0x{mapped_va:x})")
+        assertEqual(readback, test_val,
+                    "mapped VA read/write must succeed via two-stage translation")
+
+        # Access unmapped VA -- must fail with CannotAccess.
+        # The identity map covers only entry 0 (PA 0..0x7FFFFFFFFF).
+        # Use an address in entry 1 region (0x8000000000) which is unmapped.
+        unmapped_va = 0x0000_0080_0000_0000
+        access_failed = False
+        try:
+            self.gdb.p(f"*((unsigned int*)0x{unmapped_va:x})")
+        except testlib.CannotAccess:
+            access_failed = True
+        assertEqual(access_failed, True,
+                    f"access to unmapped VA 0x{unmapped_va:x} must fail")
+
+        # No security faults from any of the above
+        any_f, all_f = self.parse_security_faults()
+        assertEqual(any_f, 0,
+                    "two-stage translation operations must not raise security faults")
+        assertEqual(all_f, 0,
+                    "two-stage translation operations must not raise security faults")
+
         # Clear haltreq
         self.gdb.command(f"monitor riscv dm_write 0x{DMCONTROL:x} 0x00000001")
 

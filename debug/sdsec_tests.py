@@ -279,14 +279,63 @@ class SdsecSmodeMemoryConstraintsPmpPma(SdsecSmodeTest):
         readback = self.gdb.p(f"*((int*)0x{addr:x})")
         assertEqual(readback, test_val)
 
-class SdsecSmodeVirtTranslationConstraints(SdsecSmodeTest):
-    """T18: Virtual translation under S-mode debug access."""
+class SdsecSmodeVirtTranslationConstraints(SdsecTest):
+    """T18: Virtual-address translation under S-mode debug access.
+
+    Requires the smode-vm target (Sv48 identity-mapped page tables).
+    Verifies:
+      1. satp is non-zero (Sv48 active)
+      2. Write/read via mapped VA succeeds
+      3. Access to an unmapped VA fails with 'Cannot access memory'
+      4. No security faults from any of these operations
+    """
+    compile_args = ("programs/sdsec_smode_vm.c", )
+
+    def early_applicable(self):
+        return self.target.support_sdsec and \
+            getattr(self.target, 'sdsec_vm_test', False) and \
+            self.target.sdsec_smode_debug
+
+    def setup(self):
+        pass
+
     def test(self):
-        addr = self.hart.ram
+        # 1. Confirm hart is in S-mode with Sv48 active
+        priv = self.gdb.p("$priv")
+        assertEqual(priv, 1, "hart should be in S-mode (priv=1)")
+
+        satp = self.gdb.p("$satp")
+        assertNotEqual(satp, 0, "satp must be non-zero (Sv48 active)")
+        satp_mode = (satp >> 60) & 0xF
+        assertEqual(satp_mode, 9,
+                    f"satp mode should be 9 (Sv48), got {satp_mode}")
+
+        # 2. Write/read via mapped VA (identity-mapped, VA == PA)
+        mapped_va = self.hart.ram  # 0x1212340000
         test_val = 0xfeedface
-        self.gdb.p(f"*((int*)0x{addr:x}) = 0x{test_val:x}")
-        readback = self.gdb.p(f"*((int*)0x{addr:x})")
-        assertEqual(readback, test_val)
+        self.gdb.p(f"*((unsigned int*)0x{mapped_va:x}) = 0x{test_val:x}")
+        readback = self.gdb.p(f"*((unsigned int*)0x{mapped_va:x})")
+        assertEqual(readback, test_val,
+                    "mapped VA read/write should succeed via translation")
+
+        # 3. Access unmapped VA -- must fail with CannotAccess.
+        # The identity map covers only VPN[3]=0 (PA 0..0x7FFFFFFFFF).
+        # Use an address in VPN[3]=1 region (0x8000000000) which is unmapped.
+        unmapped_va = 0x0000_0080_0000_0000  # VPN[3]=1, outside mapped region
+        access_failed = False
+        try:
+            self.gdb.p(f"*((unsigned int*)0x{unmapped_va:x})")
+        except testlib.CannotAccess:
+            access_failed = True
+        assertEqual(access_failed, True,
+                    f"access to unmapped VA 0x{unmapped_va:x} must fail")
+
+        # 4. No security faults from any of the above
+        any_f, all_f = self.parse_security_faults()
+        assertEqual(any_f, 0,
+                    "VA translation operations must not raise security faults")
+        assertEqual(all_f, 0,
+                    "VA translation operations must not raise security faults")
 
 class SdsecSmodeNoStopInMmode(SdsecSmodeTest):
     """T19: SEDBGALW=1 must NOT allow halt in M-mode.
@@ -521,14 +570,64 @@ class SdsecUmodeMemoryConstraintsPmpPma(SdsecUmodeTest):
         readback = self.gdb.p(f"*((int*)0x{addr:x})")
         assertEqual(readback, test_val)
 
-class SdsecUmodeVirtTranslationConstraints(SdsecUmodeTest):
-    """T30: U/VU translation and page-permission checks."""
+class SdsecUmodeVirtTranslationConstraints(SdsecTest):
+    """T30: Virtual-address translation under U-mode debug access.
+
+    Requires the umode-vm target (Sv48 identity-mapped page tables with PTE_U).
+    Verifies:
+      1. Hart is in U-mode (priv=0)
+      2. satp is non-zero (Sv48 active)
+      3. Write/read via mapped VA succeeds
+      4. Access to an unmapped VA fails with 'Cannot access memory'
+      5. No security faults from any of these operations
+    """
+    compile_args = ("programs/sdsec_umode_vm.c", )
+
+    def early_applicable(self):
+        return self.target.support_sdsec and \
+            getattr(self.target, 'sdsec_vm_test', False) and \
+            not self.target.sdsec_mmode_debug and \
+            not self.target.sdsec_smode_debug
+
+    def setup(self):
+        pass
+
     def test(self):
-        addr = self.hart.ram
+        # 1. Confirm hart is in U-mode
+        priv = self.gdb.p("$priv")
+        assertEqual(priv, 0, "hart should be in U-mode (priv=0)")
+
+        # 2. Confirm VM is active via program flag (satp CSR is S-mode only,
+        #    not readable from U-mode debug privilege)
+        vm_active = self.gdb.p("vm_active")
+        assertEqual(vm_active, 1, "vm_active flag must be set (Sv48 enabled)")
+
+        # 3. Write/read via mapped VA (identity-mapped, VA == PA)
+        mapped_va = self.hart.ram  # 0x1212340000
         test_val = 0xbabe0002
-        self.gdb.p(f"*((int*)0x{addr:x}) = 0x{test_val:x}")
-        readback = self.gdb.p(f"*((int*)0x{addr:x})")
-        assertEqual(readback, test_val)
+        self.gdb.p(f"*((unsigned int*)0x{mapped_va:x}) = 0x{test_val:x}")
+        readback = self.gdb.p(f"*((unsigned int*)0x{mapped_va:x})")
+        assertEqual(readback, test_val,
+                    "mapped VA read/write should succeed via translation")
+
+        # 4. Access unmapped VA -- must fail with CannotAccess.
+        # The identity map covers only VPN[3]=0 (PA 0..0x7FFFFFFFFF).
+        # Use an address in VPN[3]=1 region (0x8000000000) which is unmapped.
+        unmapped_va = 0x0000_0080_0000_0000  # VPN[3]=1, outside mapped region
+        access_failed = False
+        try:
+            self.gdb.p(f"*((unsigned int*)0x{unmapped_va:x})")
+        except testlib.CannotAccess:
+            access_failed = True
+        assertEqual(access_failed, True,
+                    f"access to unmapped VA 0x{unmapped_va:x} must fail")
+
+        # 5. No security faults from any of the above
+        any_f, all_f = self.parse_security_faults()
+        assertEqual(any_f, 0,
+                    "VA translation operations must not raise security faults")
+        assertEqual(all_f, 0,
+                    "VA translation operations must not raise security faults")
 
 class SdsecUmodeNoStopInHigherModes(SdsecUmodeTest):
     """T31: UEDBGALW=1 must NOT allow halt in S-mode.
@@ -891,6 +990,146 @@ class SdsecVsmodeNoStopHigherModes(SdsecVsmodeTest):
                     "ALLSECURED must be 1 with mdbgen=0")
         # Clear haltreq
         self.gdb.command(f"monitor riscv dm_write 0x{DMCONTROL:x} 0x00000001")
+
+
+# ---------- Phase 7: PMP denial tests (T54, T55, T57) ----------
+
+class SdsecSmodePmpDenied(SdsecTest):
+    """T54: S-mode debug access to a PMP-denied region fails (sdsec.adoc memory constraints).
+
+    Boot binary configures PMP entry 0 as a locked NAPOT 4 KB deny region at
+    hart.ram + 0x4000.  In S-mode debug, reading from the allowed region
+    succeeds while reading from the denied region returns a memory-access
+    error.  PMP denial is an access fault, not a security fault, so
+    ANYSECFAULT must remain 0."""
+    compile_args = ("programs/sdsec_smode_pmp.c", )
+
+    def early_applicable(self):
+        return self.target.support_sdsec \
+            and not self.target.sdsec_mmode_debug \
+            and self.target.sdsec_smode_debug \
+            and getattr(self.target, 'sdsec_pmp_deny', False)
+
+    def setup(self):
+        pass
+
+    def test(self):
+        priv = self.gdb.p("$priv")
+        assertEqual(priv, 1, "hart should be in S-mode (priv=1)")
+
+        # Allowed region access must succeed
+        addr = self.hart.ram
+        test_val = 0xabcd1234
+        self.gdb.p(f"*((int*)0x{addr:x}) = 0x{test_val:x}")
+        readback = self.gdb.p(f"*((int*)0x{addr:x})")
+        assertEqual(readback, test_val)
+
+        # PMP-denied region access must fail
+        denied_addr = self.hart.ram + 0x4000
+        output = self.gdb.command(
+            f"print/x *((int*)0x{denied_addr:x})")
+        assertIn("Cannot access memory", output)
+
+        # PMP denial must not raise security faults
+        any_f, _ = self.parse_security_faults()
+        assertEqual(any_f, 0,
+                    "PMP denial must not raise security faults")
+
+class SdsecUmodePmpDenied(SdsecTest):
+    """T55: U-mode debug access to a PMP-denied region fails.
+
+    Same PMP layout as T54 but with U-mode debug privilege.  The denied
+    4 KB region at hart.ram + 0x4000 must be inaccessible and no security
+    faults should be raised."""
+    compile_args = ("programs/sdsec_umode_pmp.c", )
+
+    def early_applicable(self):
+        return self.target.support_sdsec \
+            and not self.target.sdsec_mmode_debug \
+            and not self.target.sdsec_smode_debug \
+            and not getattr(self.target, 'sdsec_deny', False) \
+            and getattr(self.target, 'sdsec_pmp_deny', False)
+
+    def setup(self):
+        pass
+
+    def test(self):
+        priv = self.gdb.p("$priv")
+        assertEqual(priv, 0, "hart should be in U-mode (priv=0)")
+
+        # Allowed region access must succeed
+        addr = self.hart.ram
+        test_val = 0xcafe0001
+        self.gdb.p(f"*((int*)0x{addr:x}) = 0x{test_val:x}")
+        readback = self.gdb.p(f"*((int*)0x{addr:x})")
+        assertEqual(readback, test_val)
+
+        # PMP-denied region access must fail
+        denied_addr = self.hart.ram + 0x4000
+        output = self.gdb.command(
+            f"print/x *((int*)0x{denied_addr:x})")
+        assertIn("Cannot access memory", output)
+
+        # PMP denial must not raise security faults
+        any_f, _ = self.parse_security_faults()
+        assertEqual(any_f, 0,
+                    "PMP denial must not raise security faults")
+
+class SdsecFullPmpBypass(SdsecTest):
+    """T57: M-mode debug bypasses PMP — access to PMP-denied region succeeds.
+
+    Configures PMP from M-mode debug to create a locked 4 KB deny region at
+    hart.ram + 0x4000, then verifies that M-mode debug can still read/write
+    that region.  M-mode debug operates with machine-level privilege which
+    is not subject to PMP restrictions.
+
+    Uses the standard full target (mdbgen=1).  PMP is configured via CSR
+    writes from debug mode rather than from a boot binary, avoiding timing
+    races with the OpenOCD halt."""
+
+    def early_applicable(self):
+        return super().early_applicable() and self.target.sdsec_mmode_debug
+
+    def test(self):
+        # Configure PMP from debug mode:
+        #   Entry 0: NAPOT 4 KB deny at hart.ram + 0x4000, NOT locked, no perms
+        #   Entry 1: NAPOT full range, RWX
+        # L=0 is critical: locked entries (L=1) restrict ALL modes including
+        # M-mode per spec. L=0 entries only restrict S/U-mode; M-mode bypasses.
+        denied_base = self.hart.ram + 0x4000
+        # NAPOT pmpaddr for 4 KB (2^12): low 9 bits set
+        pmpaddr0_val = (denied_base >> 2) | 0x1FF
+        pmpaddr1_val = 0xFFFFFFFFFFFFFFFF
+        # pmpcfg0: entry0=0x18 (NAPOT|no perms, L=0), entry1=0x1F (NAPOT|RWX)
+        pmpcfg0_val = (0x1F << 8) | 0x18
+        self.gdb.p(f"$pmpaddr0=0x{pmpaddr0_val:x}")
+        self.gdb.p(f"$pmpaddr1=0x{pmpaddr1_val:x}")
+        self.gdb.p(f"$pmpcfg0=0x{pmpcfg0_val:x}")
+
+        # Verify PMP is configured
+        readback_cfg = self.gdb.p("$pmpcfg0")
+        assertEqual(readback_cfg, pmpcfg0_val,
+                    "pmpcfg0 should hold the configured value")
+
+        # Allowed region access
+        addr = self.hart.ram
+        test_val = 0x12345678
+        self.gdb.p(f"*((int*)0x{addr:x}) = 0x{test_val:x}")
+        readback = self.gdb.p(f"*((int*)0x{addr:x})")
+        assertEqual(readback, test_val)
+
+        # PMP-denied region must still be accessible in M-mode debug
+        denied_addr = self.hart.ram + 0x4000
+        deny_val = 0xdeadbeef
+        self.gdb.p(f"*((unsigned int*)0x{denied_addr:x}) = 0x{deny_val:x}")
+        readback = self.gdb.p(f"*((unsigned int*)0x{denied_addr:x})")
+        assertEqual(readback, deny_val,
+                    "M-mode debug must bypass PMP and access denied region")
+
+        # No security faults
+        any_f, _ = self.parse_security_faults()
+        assertEqual(any_f, 0,
+                    "M-mode debug PMP bypass must not raise security faults")
 
 
 def main():

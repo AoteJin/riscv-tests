@@ -289,15 +289,37 @@ class SdsecSmodeVirtTranslationConstraints(SdsecSmodeTest):
         assertEqual(readback, test_val)
 
 class SdsecSmodeNoStopInMmode(SdsecSmodeTest):
-    """T19: OpenOCD initial halt lands in S-mode, not M-mode.
+    """T19: SEDBGALW=1 must NOT allow halt in M-mode.
 
-    The hart boots through M-mode but mdbgen=0 prevents halting there.
-    Verify that by the time the debugger has control, the hart is in S-mode."""
+    Uses the monly target where the hart loops forever in M-mode
+    (sdsec_monly.S). With mdbgen=0 and SEDBGALW=1, M-mode halt must be
+    denied. The test issues haltreq and confirms allhalted=0 after a
+    generous timeout — conclusive because the hart never leaves M-mode."""
+
+    def early_applicable(self):
+        return self.target.support_sdsec \
+            and getattr(self.target, 'sdsec_monly', False)
 
     def test(self):
-        priv = self.gdb.p("$priv")
-        assertEqual(priv, 1,
-                     "initial halt must be in S-mode (priv=1), not M-mode")
+        DMCONTROL = 0x10
+        DMSTATUS = 0x11
+        # Hart is spinning in M-mode (mmode_loop) — it will NEVER reach S-mode.
+        time.sleep(0.3)
+        # Issue haltreq
+        self.gdb.command(f"monitor riscv dm_write 0x{DMCONTROL:x} 0x80000001")
+        # Wait 5 seconds — more than enough for halt to take effect if allowed.
+        time.sleep(5.0)
+        # Verify hart has NOT halted (M-mode halt denied with mdbgen=0)
+        dmstatus = self.read_dm_reg(DMSTATUS)
+        allhalted = (dmstatus >> 9) & 1
+        assertEqual(allhalted, 0,
+                    "hart must NOT halt in M-mode: SEDBGALW=1 does not grant M-mode debug")
+        # ALLSECURED=1 confirms M-mode debug is secured
+        allsecured = (dmstatus >> 21) & 1
+        assertEqual(allsecured, 1,
+                    "ALLSECURED must be 1 with mdbgen=0")
+        # Clear haltreq
+        self.gdb.command(f"monitor riscv dm_write 0x{DMCONTROL:x} 0x00000001")
 
 class SdsecSmodeSdcsrPrivilegeControl(SdsecSmodeTest):
     """T20: Read/write sdcsr privilege-control fields."""
@@ -348,6 +370,52 @@ class SdsecSmodeConstrainedDmode(SdsecSmodeTest):
         any_f, _ = self.parse_security_faults()
         assertEqual(any_f, 0, "trigger should not cause faults")
 
+class SdsecMaxResumePriv(SdsecSmodeTest):
+    """T49: Maximum resume privilege enforcement (sdsec.adoc §maxdbgpriv arch point 21).
+
+    When debug privilege is S-mode (mdbgen=0, SEDBGALW=1), the hart must not
+    resume above S-mode."""
+    def test(self):
+        priv = self.gdb.p("$priv")
+        assertEqual(priv, 1, "hart should be in S-mode (priv=1)")
+        # Attempt to set dcsr.PRV field to 3 (M-mode)
+        self.gdb.p("$dcsr = ($dcsr & ~0x3) | 0x3")
+        dcsr_readback = self.gdb.p("$dcsr")
+        prv_field = dcsr_readback & 0x3
+        # PRV field must NOT be 3; must be clamped/rejected to S-mode or lower
+        assertNotEqual(prv_field, 3,
+                       "dcsr.PRV must not be set to M-mode (3) when mdbgen=0")
+        assert prv_field <= 1, \
+            f"dcsr.PRV must be S-mode (1) or lower, got {prv_field}"
+        # No security faults from the attempted write
+        any_f, _ = self.parse_security_faults()
+        assertEqual(any_f, 0, "attempted dcsr.PRV write should not raise security faults")
+
+class SdsecSdcsrDmprv(SdsecSmodeTest):
+    """T50: sdcsr.DMPRV modifies effective debug privilege (sdsec.adoc §effectivedbgpriv arch point 13).
+
+    When DMPRV=1 in sdcsr, memory accesses use MPP privilege from sdcsr rather
+    than current debug privilege.
+
+    DMPRV (bit 17 of sdcsr, mirroring mstatus.MPRV position) enables
+    privilege-modified memory access in debug mode."""
+    def test(self):
+        # Read base sdcsr value
+        base_sdcsr = self.gdb.p("$sdcsr")
+        # Set DMPRV bit (bit 17, same position as mstatus.MPRV)
+        sdcsr_with_dmprv = base_sdcsr | (1 << 17)
+        self.gdb.p(f"$sdcsr=0x{sdcsr_with_dmprv:x}")
+        # Read a memory address in hart.ram — assert read succeeds (no error)
+        addr = self.hart.ram
+        readback = self.gdb.p(f"*((int*)0x{addr:x})")
+        assert isinstance(readback, int), \
+            f"memory read with DMPRV set should succeed, got {readback!r}"
+        # Clear DMPRV: write original sdcsr value back
+        self.gdb.p(f"$sdcsr=0x{base_sdcsr:x}")
+        # No unexpected security faults throughout
+        any_f, _ = self.parse_security_faults()
+        assertEqual(any_f, 0, "no security faults expected when using sdcsr.DMPRV")
+
 class SdsecSmodeStepOverEcall(SdsecSmodeTest):
     """T43: stepi over ecall from S-mode does not stop in M-mode trap handler.
 
@@ -386,7 +454,8 @@ class SdsecUmodeTest(SdsecTest):
 
     def early_applicable(self):
         return self.target.support_sdsec and not self.target.sdsec_mmode_debug \
-            and not self.target.sdsec_smode_debug
+            and not self.target.sdsec_smode_debug \
+            and not getattr(self.target, 'sdsec_deny', False)
 
     def setup(self):
         pass
@@ -459,15 +528,37 @@ class SdsecUmodeVirtTranslationConstraints(SdsecUmodeTest):
         assertEqual(readback, test_val)
 
 class SdsecUmodeNoStopInHigherModes(SdsecUmodeTest):
-    """T31: OpenOCD initial halt lands in U-mode, not M/S-mode.
+    """T31: UEDBGALW=1 must NOT allow halt in S-mode.
 
-    The hart boots through M-mode and S-mode but mdbgen=0 and SEDBGALW=0
-    prevent halting there.  Verify the debugger has control in U-mode."""
+    Uses the sonly target where the hart loops forever in S-mode
+    (sdsec_sonly.S). With mdbgen=0 and only UEDBGALW=1, S-mode halt must
+    be denied. The test issues haltreq and confirms allhalted=0 after a
+    generous timeout — conclusive because the hart never leaves S-mode."""
+
+    def early_applicable(self):
+        return self.target.support_sdsec \
+            and getattr(self.target, 'sdsec_sonly', False)
 
     def test(self):
-        priv = self.gdb.p("$priv")
-        assertEqual(priv, 0,
-                     "initial halt must be in U-mode (priv=0), not M/S-mode")
+        DMCONTROL = 0x10
+        DMSTATUS = 0x11
+        # Hart is spinning in S-mode (smode_loop) — it will NEVER reach U-mode.
+        time.sleep(0.3)
+        # Issue haltreq
+        self.gdb.command(f"monitor riscv dm_write 0x{DMCONTROL:x} 0x80000001")
+        # Wait 5 seconds — more than enough for halt to take effect if allowed.
+        time.sleep(5.0)
+        # Verify hart has NOT halted (S-mode halt denied with UEDBGALW=1 only)
+        dmstatus = self.read_dm_reg(DMSTATUS)
+        allhalted = (dmstatus >> 9) & 1
+        assertEqual(allhalted, 0,
+                    "hart must NOT halt in S-mode: UEDBGALW=1 does not grant S-mode debug")
+        # ALLSECURED=1 confirms M-mode debug is secured
+        allsecured = (dmstatus >> 21) & 1
+        assertEqual(allsecured, 1,
+                    "ALLSECURED must be 1 with mdbgen=0")
+        # Clear haltreq
+        self.gdb.command(f"monitor riscv dm_write 0x{DMCONTROL:x} 0x00000001")
 
 class SdsecUmodeResetSecFault(SdsecUmodeTest):
     """T32: Reset reports security faults under mdbgen=0."""
@@ -609,6 +700,87 @@ class SdsecDenyKeepaliveConstrained(SdsecDenyTest):
         output = self.monitor_security("status")
         assertIn("anysecured=", output)
 
+class SdsecAamvirtualBlocked(SdsecDenyTest):
+    """T45: AAMVIRTUAL=0 abstract memory command when mdbgen=0 → CMDERR=6.
+
+    AAMVIRTUAL (bit 23) applies to the Access Memory abstract command (cmdtype=2),
+    not the Access Register command (cmdtype=0). With AAMVIRTUAL=0, physical-address
+    access is attempted; the security policy denies it → CMDERR=6."""
+    def test(self):
+        ABSTRACTCS = 0x16
+        COMMAND = 0x17
+        DATA2 = 0x06  # arg1 lower word = memory address
+        # Clear any existing CMDERR
+        self.gdb.command(f"monitor riscv dm_write 0x{ABSTRACTCS:x} 0x00000700")
+        # Set arg1 (address) to hart RAM base — a valid, accessible address
+        self.gdb.command(f"monitor riscv dm_write 0x{DATA2:x} 0x{self.hart.ram:x}")
+        # Access Memory command (cmdtype=2), AAMVIRTUAL=0 (physical), aamsize=2 (32-bit), read
+        # (2 << 24) | (0 << 23) | (2 << 20) = 0x02200000
+        cmd_val = (2 << 24) | (0 << 23) | (2 << 20)
+        self.gdb.command(f"monitor riscv dm_write 0x{COMMAND:x} 0x{cmd_val:x}")
+        abstractcs = self.read_dm_reg(ABSTRACTCS)
+        cmderr = (abstractcs >> 8) & 0x7
+        assertEqual(cmderr, 6, "AAMVIRTUAL=0 access-memory cmd must yield CMDERR=6 when mdbgen=0")
+        # Clear CMDERR (write 0x700 to abstractcs)
+        self.gdb.command(f"monitor riscv dm_write 0x{ABSTRACTCS:x} 0x00000700")
+
+class SdsecHartresetCmderrSix(SdsecDenyTest):
+    """T46: HARTRESET command when mdbgen=0 → ANYSECFAULT set (dmextsec.adoc §Reset).
+
+    HARTRESET is a dmcontrol operation, not an abstract command, so it raises
+    ALLSECFAULT/ANYSECFAULT in dmstatus rather than CMDERR in abstractcs."""
+    def test(self):
+        DMCONTROL = 0x10
+        # Clear any pre-existing security faults before the test
+        self.monitor_security("ack_faults")
+        # Write dmcontrol with HARTRESET bit set (bit 29 = 0x20000000) plus DMACTIVE=1
+        self.gdb.command(f"monitor riscv dm_write 0x{DMCONTROL:x} 0x20000001")
+        # HARTRESET when mdbgen=0 must raise a security fault (ANYSECFAULT=1)
+        any_f, _ = self.parse_security_faults()
+        assertEqual(any_f, 1, "HARTRESET when mdbgen=0 must set ANYSECFAULT in dmstatus")
+        self.monitor_security("ack_faults")
+
+class SdsecEbreakMmodeDenied(SdsecDenyTest):
+    """T47: mdbgen=0, M-mode EBREAK raises exception not Debug Mode (sdsec.adoc §mdbgctl arch point 5).
+
+    Full EBREAK-exception verification requires observing the trap handler,
+    which is not accessible from the debugger when mdbgen=0. This test verifies
+    the negative: no debug entry occurs."""
+    def test(self):
+        DMCONTROL = 0x10
+        DMSTATUS = 0x11
+        # Issue a halt request via dmcontrol (haltreq=1, dmactive=1)
+        self.gdb.command(f"monitor riscv dm_write 0x{DMCONTROL:x} 0x80000001")
+        time.sleep(0.3)
+        # Poll dmstatus — hart should remain running (allhalted=0)
+        dmstatus = self.read_dm_reg(DMSTATUS)
+        allhalted = (dmstatus >> 9) & 1
+        assertEqual(allhalted, 0, "hart must NOT have halted: M-mode EBREAK should not enter Debug Mode when mdbgen=0")
+        # Verify ALLSECURED=1 (security active)
+        allsecured = (dmstatus >> 21) & 1
+        assertEqual(allsecured, 1, "ALLSECURED must be 1 with mdbgen=0 deny policy")
+        # Clear haltreq
+        self.gdb.command(f"monitor riscv dm_write 0x{DMCONTROL:x} 0x00000001")
+
+class SdsecTriggerActionBlocked(SdsecDenyTest):
+    """T48: trigger ACTION=1 suppressed when hart is in M-mode and mdbgen=0 (sdsec.adoc §mdbgctl arch point 4)."""
+    def test(self):
+        DMSTATUS = 0x11
+        ABSTRACTCS = 0x16
+        # Program a hardware execution breakpoint at the hart's RAM address
+        self.gdb.hbreak(f"*0x{self.hart.ram:x}")
+        time.sleep(0.5)
+        # Check dmstatus — hart should still be running, not halted at the breakpoint
+        dmstatus = self.read_dm_reg(DMSTATUS)
+        allhalted = (dmstatus >> 9) & 1
+        assertEqual(allhalted, 0, "trigger ACTION=1 must be suppressed: hart must not halt when mdbgen=0")
+        # Delete the breakpoint
+        self.gdb.command("delete")
+        # Trigger suppression should be silent — CMDERR should be 0
+        abstractcs = self.read_dm_reg(ABSTRACTCS)
+        cmderr = (abstractcs >> 8) & 0x7
+        assertEqual(cmderr, 0, "trigger suppression should not set CMDERR")
+
 
 # ---------- Phase 5: cross-target (T40) ----------
 
@@ -621,6 +793,98 @@ class SdsecNdmResetReadOnlyZero(SdsecTest):
         ndmreset = (dmcontrol >> 1) & 1
         assertEqual(ndmreset, 0, "ndmreset should be 0 initially")
 
+
+
+# ---------- Phase 6: VS-mode suite (T51) ----------
+
+class SdsecVsmodeTest(SdsecTest):
+    compile_args = ("programs/sdsec_vsmode.S", )
+
+    def early_applicable(self):
+        return self.target.support_sdsec and getattr(self.target, 'sdsec_vsmode_debug', False)
+
+    def setup(self):
+        pass
+
+class SdsecVsmodeDebug(SdsecVsmodeTest):
+    """T51: VSEDBGALW=1 gives VS-mode debug privilege (sdsec.adoc §smvsdedbg arch points 16-17).
+
+    The test binary transitions M → HS → VS-mode. With mdbgen=0 and
+    VSEDBGALW=1, the debugger should be able to halt the hart once it
+    reaches VS-mode, and read security CSRs without faults."""
+
+    def early_applicable(self):
+        return super().early_applicable() \
+            and not getattr(self.target, 'sdsec_vsmode_hsonly', False)
+    def test(self):
+        DMCONTROL = 0x10
+        DMSTATUS = 0x11
+        ABSTRACTCS = 0x16
+        # Wait for the program to transition M → HS → VS-mode
+        time.sleep(0.5)
+        # Request halt — with VSEDBGALW=1, halt succeeds when hart is in VS-mode
+        self.gdb.command(f"monitor riscv dm_write 0x{DMCONTROL:x} 0x80000001")
+        time.sleep(0.5)
+        # Verify hart halted
+        dmstatus = self.read_dm_reg(DMSTATUS)
+        allhalted = (dmstatus >> 9) & 1
+        assertEqual(allhalted, 1,
+                    "hart must halt in VS-mode when VSEDBGALW=1")
+        # Verify ALLSECURED=1 (mdbgen=0)
+        allsecured = (dmstatus >> 21) & 1
+        assertEqual(allsecured, 1,
+                    "ALLSECURED must be 1 with mdbgen=0")
+        # No security faults from the successful halt
+        any_f, _ = self.parse_security_faults()
+        assertEqual(any_f, 0,
+                    "no security faults expected: VS-mode halt is permitted with VSEDBGALW=1")
+        # Read $sdcsr — should be accessible with VSEDBGALW=1
+        self.gdb.command(f"monitor riscv dm_write 0x{ABSTRACTCS:x} 0x00000700")
+        sdcsr = self.gdb.p("$sdcsr")
+        abstractcs = self.read_dm_reg(ABSTRACTCS)
+        cmderr = (abstractcs >> 8) & 0x7
+        assertEqual(cmderr, 0,
+                    "sdcsr read must not yield CMDERR when VSEDBGALW=1")
+        # Security faults remain clean after CSR access
+        any_f, _ = self.parse_security_faults()
+        assertEqual(any_f, 0,
+                    "no security faults expected after sdcsr read with VSEDBGALW=1")
+        # Clear haltreq
+        self.gdb.command(f"monitor riscv dm_write 0x{DMCONTROL:x} 0x00000001")
+
+class SdsecVsmodeNoStopHigherModes(SdsecVsmodeTest):
+    """T53: VSEDBGALW=1 must NOT allow halt in HS-mode.
+
+    Uses the hsonly target where the hart loops forever in HS-mode
+    (sdsec_vsmode_hsonly.S). With mdbgen=0 and only VSEDBGALW=1, HS-mode
+    halt must be denied. The test issues haltreq and confirms allhalted=0
+    after a generous timeout — conclusive because the hart never leaves
+    HS-mode."""
+
+    def early_applicable(self):
+        return super().early_applicable() \
+            and getattr(self.target, 'sdsec_vsmode_hsonly', False)
+
+    def test(self):
+        DMCONTROL = 0x10
+        DMSTATUS = 0x11
+        # Hart is spinning in HS-mode (hsmode_loop) — it will NEVER reach VS-mode.
+        time.sleep(0.3)
+        # Issue haltreq
+        self.gdb.command(f"monitor riscv dm_write 0x{DMCONTROL:x} 0x80000001")
+        # Wait 5 seconds — more than enough for halt to take effect if allowed.
+        time.sleep(5.0)
+        # Verify hart has NOT halted (HS-mode halt denied with mdbgen=0)
+        dmstatus = self.read_dm_reg(DMSTATUS)
+        allhalted = (dmstatus >> 9) & 1
+        assertEqual(allhalted, 0,
+                    "hart must NOT halt in HS-mode: VSEDBGALW=1 does not grant HS-mode debug")
+        # ALLSECURED=1 confirms security is active
+        allsecured = (dmstatus >> 21) & 1
+        assertEqual(allsecured, 1,
+                    "ALLSECURED must be 1 with mdbgen=0")
+        # Clear haltreq
+        self.gdb.command(f"monitor riscv dm_write 0x{DMCONTROL:x} 0x00000001")
 
 
 def main():

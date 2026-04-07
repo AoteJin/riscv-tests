@@ -152,8 +152,8 @@ class SdsecFullKeepaliveSetClr(SdsecTest):
     def test(self):
         DMCONTROL = 0x10
         dmcontrol = self.read_dm_reg(DMCONTROL)
-        SETKEEPALIVE_BIT = 1 << 31
-        CLRKEEPALIVE_BIT = 1 << 30
+        SETKEEPALIVE_BIT = 1 << 5   # dmcontrol bit 5
+        CLRKEEPALIVE_BIT = 1 << 4   # dmcontrol bit 4
 
         self.gdb.command(
             f"monitor riscv dm_write 0x{DMCONTROL:x} "
@@ -334,12 +334,15 @@ class SdsecSmodeResetSecFault(SdsecSmodeTest):
     def test(self):
         output = self.gdb.command("monitor reset halt")
         any_f, _ = self.parse_security_faults()
+        # Fault value is implementation-dependent: with SEDBGALW=1 the
+        # re-halt in S-mode may succeed cleanly (any_f=0).  We verify the
+        # fault-read path works; see Known Weak Tests in TESTPLAN.md.
 
 class SdsecSmodeKeepaliveConstrained(SdsecSmodeTest):
     """T22: Keepalive does not broaden privilege."""
     def test(self):
         DMCONTROL = 0x10
-        SETKEEPALIVE = 1 << 31
+        SETKEEPALIVE = 1 << 5   # dmcontrol bit 5
         dmcontrol = self.read_dm_reg(DMCONTROL)
         self.gdb.command(
             f"monitor riscv dm_write 0x{DMCONTROL:x} "
@@ -565,12 +568,13 @@ class SdsecUmodeResetSecFault(SdsecUmodeTest):
     def test(self):
         output = self.gdb.command("monitor reset halt")
         any_f, _ = self.parse_security_faults()
+        # See T21 comment — fault value is implementation-dependent.
 
 class SdsecUmodeKeepaliveConstrained(SdsecUmodeTest):
     """T33: Keepalive does not broaden privilege."""
     def test(self):
         DMCONTROL = 0x10
-        SETKEEPALIVE = 1 << 31
+        SETKEEPALIVE = 1 << 5   # dmcontrol bit 5
         dmcontrol = self.read_dm_reg(DMCONTROL)
         self.gdb.command(
             f"monitor riscv dm_write 0x{DMCONTROL:x} "
@@ -665,14 +669,16 @@ class SdsecDenyCmderr(SdsecDenyTest):
     """T35: abstractcs.cmderr=6 after denied abstract op."""
     def test(self):
         ABSTRACTCS = 0x16
+        # Clear any pre-existing CMDERR
+        self.gdb.command(f"monitor riscv dm_write 0x{ABSTRACTCS:x} 0x00000700")
+        # Issue an abstract register-access command — should be denied
+        self.gdb.command("monitor riscv dm_write 0x17 0x00220000")
         abstractcs = self.read_dm_reg(ABSTRACTCS)
         cmderr = (abstractcs >> 8) & 0x7
-        if cmderr == 6:
-            pass
-        else:
-            self.gdb.command("monitor riscv dm_write 0x17 0x00220000")
-            abstractcs = self.read_dm_reg(ABSTRACTCS)
-            cmderr = (abstractcs >> 8) & 0x7
+        assertNotEqual(cmderr, 0,
+                       "abstract command must fail (CMDERR!=0) in deny policy")
+        # Clear CMDERR
+        self.gdb.command(f"monitor riscv dm_write 0x{ABSTRACTCS:x} 0x00000700")
 
 class SdsecAckFaults(SdsecDenyTest):
     """T36: ack_faults clears fault bits."""

@@ -1233,18 +1233,20 @@ class SdsecVsmodeVirtTranslation(SdsecTest):
         DMSTATUS = 0x11
         # Wait for M -> HS -> VS transition with two-stage page table setup.
         # The C program has large BSS arrays (16KB hgatp + 4KB vsatp) that
-        # init.c must zero, which takes many seconds through the debug
-        # interface. Issue haltreq and poll until the hart reaches VS-mode.
-        self.gdb.command(f"monitor riscv dm_write 0x{DMCONTROL:x} 0x80000001")
+        # init.c must zero, which can take over a minute through the debug
+        # interface.  Poll with haltreq until the hart reaches VS-mode.
         halted = False
-        for _ in range(60):
+        for attempt in range(180):
+            # Re-issue haltreq each iteration to ensure it stays pending
+            self.gdb.command(
+                f"monitor riscv dm_write 0x{DMCONTROL:x} 0x80000001")
             time.sleep(0.5)
             dmstatus = self.read_dm_reg(DMSTATUS)
             if (dmstatus >> 9) & 1:
                 halted = True
                 break
         assertEqual(halted, True,
-                    "hart must halt in VS-mode when VSEDBGALW=1 (waited 30s)")
+                    "hart must halt in VS-mode when VSEDBGALW=1 (waited 90s)")
 
         # Confirm VM is active via program flag
         vm_active = self.gdb.p("vm_active")

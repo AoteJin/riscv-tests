@@ -13,8 +13,21 @@
  *   Stage 2 (hgatp):  guest PA  -> host PA    (Sv48x4, 2048 entries at root)
  *
  * Both stages use identity mapping (VA == GPA == HPA == actual PA).
- * Only entry 0 of each root table is populated, covering PA 0..512 GiB.
- * hart.ram = 0x1212340000 (~72 GiB) falls within this range.
+ *
+ * Stage 1 (vsatp): a single level-3 leaf PTE at entry 0 maps 512 GiB.
+ *   This works because Sv48 supports level-3 superpages.
+ *
+ * Stage 2 (hgatp): a multi-level page table hierarchy:
+ *   Level-3 root (2048 entries, 16 KiB): entry 0 is a non-leaf PTE
+ *     pointing to a level-2 table.
+ *   Level-2 table (512 entries, 4 KiB): leaf PTEs at entries 0 and 72
+ *     create 1 GiB identity-mapped superpages.
+ *     - Entry 0:  covers HPA [0, 1 GiB) — low memory.
+ *     - Entry 72: covers HPA [72 GiB, 73 GiB) — contains hart.ram
+ *       (0x1212340000) and the page tables themselves (0x1220340000).
+ *
+ * A single level-3 leaf superpage in hgatp (Sv48x4 G-stage) is NOT used
+ * because Spike's Sv48x4 walker does not support level-3 leaf PTEs.
  *
  * Why Sv48 / Sv48x4:
  *   hart.ram = 0x1212340000 is a 41-bit physical address.  Sv39 only supports
@@ -29,9 +42,14 @@
 /* ---- Constants --------------------------------------------------------- */
 
 #define PAGE_SIZE       4096
-/* VS-mode pages: do NOT set PTE_U.  With PTE_U=1 the pages belong to VU-mode
- * and VS-mode instruction fetch would fault. */
+/* Stage-1 (vsatp) PTEs: do NOT set PTE_U — with PTE_U=1 the pages belong
+ * to VU-mode and VS-mode instruction fetch would fault. */
 #define PTE_FLAGS       (PTE_V | PTE_R | PTE_W | PTE_X | PTE_A | PTE_D)
+/* Stage-2 (hgatp) PTEs: MUST set PTE_U.  Spike's s2xlate() G-stage walker
+ * unconditionally rejects leaf PTEs with U=0 (mmu.cc line 593).  Per RISC-V
+ * spec, G-stage PTE_U controls VS/VU access granularity; for our test both
+ * modes need access, so PTE_U=1 is correct. */
+#define PTE_FLAGS_G     (PTE_FLAGS | PTE_U)
 
 /* vsatp CSR number (not in all encoding.h versions as a macro usable with
  * write_csr, so we use inline asm with the numeric address). */
@@ -53,11 +71,13 @@
  * hart.ram = 0x1212340000, ram_size = 0x10000000 (256 MiB).
  * vsatp root (4 KiB):  ram + 0x0E00_0000  (at 0x1220340000)
  * hgatp root (16 KiB): ram + 0x0E00_4000  (at 0x1220344000, 16 KiB aligned)
+ * hgatp L2   (4 KiB):  ram + 0x0E00_8000  (at 0x1220348000)
  * ram_size = 0x10000000 (256 MiB), so max valid = ram + 0x0FFF_FFFF.
  */
 #define HART_RAM        0x1212340000UL
 #define VSATP_ROOT_PA   (HART_RAM + 0x0E000000UL)
 #define HGATP_ROOT_PA   (HART_RAM + 0x0E004000UL)
+#define HGATP_L2_PA     (HART_RAM + 0x0E008000UL)
 
 /* ---- Program state flags ----------------------------------------------- */
 
@@ -109,10 +129,11 @@ static void hsmode_setup(void) {
      * Map only entry 0: covers PA 0..0x7FFFFFFFFF (512 GiB).
      * hart.ram = 0x1212340000 falls within this range.
      */
-    /* Zero the page table regions (only entry 0 is used, but clear
-     * a few entries to ensure PTE_V=0 for invalid slots). */
+    /* Zero the page table regions.  Only a few entries per table are used;
+     * clear a small neighbourhood to ensure PTE_V=0 for invalid slots. */
     volatile uint64_t *vsatp_pt = (volatile uint64_t *)VSATP_ROOT_PA;
     volatile uint64_t *hgatp_pt = (volatile uint64_t *)HGATP_ROOT_PA;
+    volatile uint64_t *hgatp_l2 = (volatile uint64_t *)HGATP_L2_PA;
     for (int i = 0; i < 4; i++) {
         vsatp_pt[i] = 0;
         hgatp_pt[i] = 0;
@@ -123,13 +144,35 @@ static void hsmode_setup(void) {
     /*
      * Build stage-2 page table (hgatp / Sv48x4).
      *
-     * Same PTE format as Sv48; root table just has 2048 entries instead of 512.
-     * Level-3 leaf PTE maps 2^39 bytes (512 GiB) of guest physical space to
-     * the same host physical address (identity map).
+     * Level-3 root (2048 entries): entry 0 is a non-leaf PTE pointing to
+     * the level-2 table.  A non-leaf PTE has PTE_V set but NO R/W/X bits.
+     *   PTE = (PPN_of_L2_table << PTE_PPN_SHIFT) | PTE_V
      *
-     * Map only entry 0: covers GPA 0..0x7FFFFFFFFF -> HPA 0..0x7FFFFFFFFF.
+     * Level-2 table (512 entries): leaf PTEs with 1 GiB superpage mappings.
+     *   Entry  0: identity map for PA [0, 1 GiB).
+     *   Entry 72: identity map for PA [72 GiB, 73 GiB).
+     *             hart.ram (0x1212340000) and page tables (0x1220340000)
+     *             both fall within this 1 GiB range.
+     *   PTE.ppn = PA >> 12 = (entry * 1GiB) >> 12 = entry << 18
+     *   PTE     = (PPN << PTE_PPN_SHIFT) | PTE_FLAGS
+     *           = (entry << 28) | PTE_FLAGS
      */
-    hgatp_pt[0] = ((uint64_t)0 << 37) | PTE_FLAGS;
+
+    /* Zero level-2 entries around the ones we populate. */
+    for (int i = 0; i < 4; i++)
+        hgatp_l2[i] = 0;
+    for (int i = 70; i < 76; i++)
+        hgatp_l2[i] = 0;
+
+    /* Level-2 leaf PTE at entry 0: identity map PA [0, 1 GiB). */
+    hgatp_l2[0] = ((uint64_t)0 << 28) | PTE_FLAGS_G;
+
+    /* Level-2 leaf PTE at entry 72: identity map PA [72 GiB, 73 GiB). */
+    hgatp_l2[72] = ((uint64_t)72 << 28) | PTE_FLAGS_G;
+
+    /* Level-3 root entry 0: non-leaf PTE pointing to the level-2 table.
+     * PPN = HGATP_L2_PA >> 12.  Only PTE_V is set (no R/W/X). */
+    hgatp_pt[0] = ((HGATP_L2_PA >> 12) << PTE_PPN_SHIFT) | PTE_V;
 
     /* Fence before programming address-translation CSRs. */
     __asm__ __volatile__("sfence.vma" ::: "memory");

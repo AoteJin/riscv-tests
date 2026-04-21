@@ -1236,7 +1236,7 @@ class SdsecVsmodeVirtTranslation(SdsecTest):
         # init.c must zero, which can take over a minute through the debug
         # interface.  Poll with haltreq until the hart reaches VS-mode.
         halted = False
-        for attempt in range(180):
+        for _ in range(180):
             # Re-issue haltreq each iteration to ensure it stays pending
             self.gdb.command(
                 f"monitor riscv dm_write 0x{DMCONTROL:x} 0x80000001")
@@ -1463,7 +1463,7 @@ class SdsecQuickAccessBlocked(SdsecDenyTest):
             f"monitor riscv dm_write 0x{ABSTRACTCS:x} 0x00000700")
         # Quick Access command: cmdtype=4 (bits 31:24)
         # Only field is the hart index, which is 0 for single-hart
-        cmd_val = (4 << 24)
+        cmd_val = 4 << 24
         self.gdb.command(
             f"monitor riscv dm_write 0x{COMMAND:x} 0x{cmd_val:x}")
         abstractcs = self.read_dm_reg(ABSTRACTCS)

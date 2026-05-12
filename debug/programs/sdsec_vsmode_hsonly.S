@@ -5,7 +5,7 @@
         .section .text
 main:
         # Configure PMP to allow all access from S/HS-mode
-        li      t0, 0x1f            # TOR, RWX
+        li      t0, 0x1f            # NAPOT, RWX
         csrw    CSR_PMPCFG0, t0
         li      t0, -1
         csrw    CSR_PMPADDR0, t0

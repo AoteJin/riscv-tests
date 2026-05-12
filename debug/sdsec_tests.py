@@ -615,8 +615,12 @@ class SdsecUmodeCsrPrivilegeConstraints(SdsecUmodeTest):
         readback = self.gdb.p(f"*((int*)0x{addr:x})")
         assertEqual(readback, test_val)
 
-class SdsecUmodeMemoryConstraintsPmpPma(SdsecUmodeTest):
-    """T29: Memory access obeys PMP/PMA under U-mode debug."""
+class SdsecUmodeAllowedMemoryAccess(SdsecUmodeTest):
+    """T29: U-mode debug memory access succeeds when PMP permits it.
+
+    The sdsec_umode.c payload configures broad PMP access, so this is the
+    positive allowed-memory path. PMP-denied U-mode coverage lives in T55.
+    """
     def test(self):
         addr = self.hart.ram
         test_val = 0xcafe0001
@@ -627,13 +631,19 @@ class SdsecUmodeMemoryConstraintsPmpPma(SdsecUmodeTest):
 class SdsecUmodeVirtTranslationConstraints(SdsecTest):
     """T30: Virtual-address translation under U-mode debug access.
 
-    Requires the umode-vm target (Sv48 identity-mapped page tables with PTE_U).
+    Requires the umode-vm target with three Sv48 outcomes:
+      - mapped U page (PTE_U=1)
+      - mapped supervisor-only page (PTE_U=0)
+      - unmapped VA
+
     Verifies:
       1. Hart is in U-mode (priv=0)
-      2. satp is non-zero (Sv48 active)
-      3. Write/read via mapped VA succeeds
-      4. Access to an unmapped VA fails with 'Cannot access memory'
-      5. No security faults from any of these operations
+      2. VM is active
+      3. PTE snapshots show the U and supervisor-only mappings
+      4. Write/read via mapped U VA succeeds
+      5. Access to mapped PTE_U=0 VA fails
+      6. Access to unmapped VA fails
+      7. No security faults from any of these operations
     """
     compile_args = ("programs/sdsec_umode_vm.c", )
 
@@ -647,6 +657,9 @@ class SdsecUmodeVirtTranslationConstraints(SdsecTest):
         pass
 
     def test(self):
+        PTE_V = 0x001
+        PTE_U = 0x010
+
         # 1. Confirm hart is in U-mode
         priv = self.gdb.p("$priv")
         assertEqual(priv, 0, "hart should be in U-mode (priv=0)")
@@ -656,18 +669,40 @@ class SdsecUmodeVirtTranslationConstraints(SdsecTest):
         vm_active = self.gdb.p("vm_active")
         assertEqual(vm_active, 1, "vm_active flag must be set (Sv48 enabled)")
 
-        # 3. Write/read via mapped VA (identity-mapped, VA == PA)
-        mapped_va = self.hart.ram  # 0x1212340000
+        # 3. Confirm the binary created distinct U and supervisor-only PTEs.
+        user_pte = self.gdb.p("user_region_pte_snapshot")
+        supervisor_pte = self.gdb.p("supervisor_only_pte_snapshot")
+        assertNotEqual(user_pte & PTE_V, 0,
+                       "U-accessible test mapping must be valid")
+        assertNotEqual(user_pte & PTE_U, 0,
+                       "U-accessible test mapping must set PTE_U")
+        assertNotEqual(supervisor_pte & PTE_V, 0,
+                       "supervisor-only test mapping must be valid")
+        assertEqual(supervisor_pte & PTE_U, 0,
+                    "supervisor-only test mapping must clear PTE_U")
+
+        # 4. Write/read via mapped U VA.
+        mapped_va = self.gdb.p("probe_va")
+        assertNotEqual(mapped_va, 0, "probe_va must be initialized")
         test_val = 0xbabe0002
         self.gdb.p(f"*((unsigned int*)0x{mapped_va:x}) = 0x{test_val:x}")
         readback = self.gdb.p(f"*((unsigned int*)0x{mapped_va:x})")
         assertEqual(readback, test_val,
-                    "mapped VA read/write should succeed via translation")
+                    "mapped PTE_U=1 VA read/write should succeed")
 
-        # 4. Access unmapped VA -- must fail with CannotAccess.
-        # The identity map covers only VPN[3]=0 (PA 0..0x7FFFFFFFFF).
-        # Use an address in VPN[3]=1 region (0x8000000000) which is unmapped.
-        unmapped_va = 0x0000_0080_0000_0000  # VPN[3]=1, outside mapped region
+        # 5. Access mapped supervisor-only VA -- must fail for U debug.
+        supervisor_va = self.gdb.p("supervisor_only_va")
+        access_failed = False
+        try:
+            self.gdb.p(f"*((unsigned int*)0x{supervisor_va:x})")
+        except testlib.CannotAccess:
+            access_failed = True
+        assertEqual(access_failed, True,
+                    "access to mapped PTE_U=0 VA "
+                    f"0x{supervisor_va:x} must fail")
+
+        # 6. Access unmapped VA -- must fail with CannotAccess.
+        unmapped_va = self.gdb.p("unmapped_va")
         access_failed = False
         try:
             self.gdb.p(f"*((unsigned int*)0x{unmapped_va:x})")
@@ -676,7 +711,7 @@ class SdsecUmodeVirtTranslationConstraints(SdsecTest):
         assertEqual(access_failed, True,
                     f"access to unmapped VA 0x{unmapped_va:x} must fail")
 
-        # 5. No security faults from any of the above
+        # 7. No security faults from any of the above.
         any_f, all_f = self.parse_security_faults()
         assertEqual(any_f, 0,
                     "VA translation operations must not raise security faults")
